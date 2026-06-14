@@ -1,0 +1,555 @@
+from aiogram import Router, F
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+
+from middleware import AccessMiddleware
+from db.database import get_blocked_gifts, unblock_gift, block_gift
+
+router = Router()
+router.callback_query.middleware(AccessMiddleware())
+
+PAGE_SIZE = 8
+
+
+@router.callback_query(F.data == "menu_blocked")
+async def cb_menu_blocked(cb: CallbackQuery):
+    await show_blocked(cb, page=0)
+
+
+@router.callback_query(F.data.startswith("blocked_page_"))
+async def cb_blocked_page(cb: CallbackQuery):
+    page = int(cb.data.split("_")[2])
+    await show_blocked(cb, page=page)
+
+
+async def show_blocked(cb: CallbackQuery, page: int):
+    blocked = await get_blocked_gifts(cb.from_user.id)
+
+    if not blocked:
+        await cb.message.edit_text(
+            "🚫 <b>Заблокированные подарки</b>\n\nСписок пуст.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_main")]
+            ])
+        )
+        await cb.answer()
+        return
+
+    total = len(blocked)
+    start = page * PAGE_SIZE
+    end = min(start + PAGE_SIZE, total)
+    page_items = blocked[start:end]
+
+    lines = [f"🚫 <b>Заблокированных подарков: {total}</b>\n"]
+    buttons = []
+    for item in page_items:
+        label = f"{item['gift_id']} ({item['marketplace']})"
+        lines.append(f"• {label}")
+        buttons.append([InlineKeyboardButton(
+            text=f"✅ Разблокировать {item['gift_id'][:15]}",
+            callback_data=f"unblock_{item['gift_id']}_{item['marketplace']}"
+        )])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"blocked_page_{page-1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"blocked_page_{page+1}"))
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="menu_main")])
+
+    await cb.message.edit_text(
+        "\n".join(lines), parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("unblock_"))
+async def cb_unblock(cb: CallbackQuery):
+    # unblock_{gift_id}_{marketplace}
+    parts = cb.data.split("_", 2)
+    gift_id = parts[1]
+    marketplace = parts[2]
+    await unblock_gift(cb.from_user.id, gift_id, marketplace)
+    await cb.answer(f"✅ {gift_id} разблокирован!", show_alert=False)
+    await show_blocked(cb, page=0)
+
+
+@router.callback_query(F.data.startswith("blockgift_"))
+async def cb_block_gift(cb: CallbackQuery):
+    # blockgift_{gift_id}_{marketplace}  — called from notification
+    parts = cb.data.split("_", 2)
+    gift_id = parts[1]
+    marketplace = parts[2]
+    await block_gift(cb.from_user.id, gift_id, marketplace)
+    await cb.answer(f"🚫 Подарок {gift_id} заблокирован. Уведомлений больше не будет.", show_alert=True)
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
+from middleware import AccessMiddleware
+from db.database import add_filter, get_filters, delete_filter, get_filter_count
+from config import MAX_FILTERS
+
+router = Router()
+router.message.middleware(AccessMiddleware())
+router.callback_query.middleware(AccessMiddleware())
+
+
+class AddFilterFSM(StatesGroup):
+    filter_type = State()
+    model = State()
+    background = State()
+    number_from = State()
+    number_to = State()
+    price_from = State()
+    price_to = State()
+    marketplace = State()
+    name = State()
+
+
+def filters_menu_kb(filter_type: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить фильтр", callback_data=f"filter_add_{filter_type}")],
+        [InlineKeyboardButton(text="📋 Мои фильтры", callback_data=f"filter_list_{filter_type}_0")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_main")],
+    ])
+
+
+def marketplace_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🌐 Все", callback_data="mp_all"),
+            InlineKeyboardButton(text="GetGems", callback_data="mp_getgems"),
+        ],
+        [
+            InlineKeyboardButton(text="Tonnel", callback_data="mp_tonnel"),
+            InlineKeyboardButton(text="Portals", callback_data="mp_portals"),
+        ],
+        [InlineKeyboardButton(text="MRKT", callback_data="mp_mrkt")],
+    ])
+
+
+def skip_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏭ Пропустить", callback_data="skip_step")]
+    ])
+
+
+# ── LISTINGS MENU ─────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "menu_listings")
+async def cb_menu_listings(cb: CallbackQuery):
+    count = await get_filter_count(cb.from_user.id)
+    await cb.message.edit_text(
+        f"📋 <b>Фильтры листингов</b>\n\n"
+        f"Активных фильтров: <b>{count}</b> / {MAX_FILTERS}\n\n"
+        f"Бот пришлёт уведомление, когда на маркетплейсе появится подарок по твоим параметрам.",
+        parse_mode="HTML",
+        reply_markup=filters_menu_kb("listing")
+    )
+    await cb.answer()
+
+
+# ── ADD FILTER FSM ────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.in_({"filter_add_listing", "filter_add_sale"}))
+async def cb_filter_add(cb: CallbackQuery, state: FSMContext):
+    filter_type = "listing" if "listing" in cb.data else "sale"
+    count = await get_filter_count(cb.from_user.id)
+    if count >= MAX_FILTERS:
+        await cb.answer(f"❌ Лимит {MAX_FILTERS} фильтров достигнут!", show_alert=True)
+        return
+
+    await state.set_state(AddFilterFSM.model)
+    await state.update_data(filter_type=filter_type)
+    await cb.message.edit_text(
+        "🎁 <b>Новый фильтр</b>\n\n"
+        "Шаг 1/6 — Введи <b>название модели</b> подарка (например: <code>Plush Pepe</code>)\n"
+        "или пропусти этот шаг.",
+        parse_mode="HTML",
+        reply_markup=skip_kb()
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "skip_step", AddFilterFSM.model)
+@router.message(AddFilterFSM.model)
+async def fsm_model(event, state: FSMContext):
+    if isinstance(event, Message):
+        await state.update_data(model=event.text.strip())
+    else:
+        await state.update_data(model=None)
+        event = event.message
+
+    await state.set_state(AddFilterFSM.background)
+    await event.answer(
+        "Шаг 2/6 — Введи <b>фон</b> подарка (например: <code>Blue</code>)\n"
+        "или пропусти.",
+        parse_mode="HTML",
+        reply_markup=skip_kb()
+    )
+
+
+@router.callback_query(F.data == "skip_step", AddFilterFSM.background)
+@router.message(AddFilterFSM.background)
+async def fsm_background(event, state: FSMContext):
+    if isinstance(event, Message):
+        await state.update_data(background=event.text.strip())
+    else:
+        await state.update_data(background=None)
+        event = event.message
+
+    await state.set_state(AddFilterFSM.number_from)
+    await event.answer(
+        "Шаг 3/6 — Введи <b>минимальный номер</b> подарка (например: <code>1</code>)\n"
+        "или пропусти.",
+        parse_mode="HTML",
+        reply_markup=skip_kb()
+    )
+
+
+@router.callback_query(F.data == "skip_step", AddFilterFSM.number_from)
+@router.message(AddFilterFSM.number_from)
+async def fsm_number_from(event, state: FSMContext):
+    if isinstance(event, Message):
+        try:
+            await state.update_data(number_from=int(event.text.strip()))
+        except ValueError:
+            await event.answer("❌ Введи число или пропусти.", reply_markup=skip_kb())
+            return
+    else:
+        await state.update_data(number_from=None)
+        event = event.message
+
+    await state.set_state(AddFilterFSM.number_to)
+    await event.answer(
+        "Шаг 4/6 — Введи <b>максимальный номер</b> подарка\n"
+        "или пропусти.",
+        parse_mode="HTML",
+        reply_markup=skip_kb()
+    )
+
+
+@router.callback_query(F.data == "skip_step", AddFilterFSM.number_to)
+@router.message(AddFilterFSM.number_to)
+async def fsm_number_to(event, state: FSMContext):
+    if isinstance(event, Message):
+        try:
+            await state.update_data(number_to=int(event.text.strip()))
+        except ValueError:
+            await event.answer("❌ Введи число или пропусти.", reply_markup=skip_kb())
+            return
+    else:
+        await state.update_data(number_to=None)
+        event = event.message
+
+    await state.set_state(AddFilterFSM.price_from)
+    await event.answer(
+        "Шаг 5/6 — Введи <b>минимальную цену</b> в TON (например: <code>5.5</code>)\n"
+        "или пропусти.",
+        parse_mode="HTML",
+        reply_markup=skip_kb()
+    )
+
+
+@router.callback_query(F.data == "skip_step", AddFilterFSM.price_from)
+@router.message(AddFilterFSM.price_from)
+async def fsm_price_from(event, state: FSMContext):
+    if isinstance(event, Message):
+        try:
+            await state.update_data(price_from=float(event.text.strip().replace(",", ".")))
+        except ValueError:
+            await event.answer("❌ Введи число или пропусти.", reply_markup=skip_kb())
+            return
+    else:
+        await state.update_data(price_from=None)
+        event = event.message
+
+    await state.set_state(AddFilterFSM.price_to)
+    await event.answer(
+        "Шаг 6/6 — Введи <b>максимальную цену</b> в TON\n"
+        "или пропусти.",
+        parse_mode="HTML",
+        reply_markup=skip_kb()
+    )
+
+
+@router.callback_query(F.data == "skip_step", AddFilterFSM.price_to)
+@router.message(AddFilterFSM.price_to)
+async def fsm_price_to(event, state: FSMContext):
+    if isinstance(event, Message):
+        try:
+            await state.update_data(price_to=float(event.text.strip().replace(",", ".")))
+        except ValueError:
+            await event.answer("❌ Введи число или пропусти.", reply_markup=skip_kb())
+            return
+    else:
+        await state.update_data(price_to=None)
+        event = event.message
+
+    await state.set_state(AddFilterFSM.marketplace)
+    await event.answer(
+        "Выбери <b>маркетплейс</b> для мониторинга:",
+        parse_mode="HTML",
+        reply_markup=marketplace_kb()
+    )
+
+
+@router.callback_query(F.data.startswith("mp_"), AddFilterFSM.marketplace)
+async def fsm_marketplace(cb: CallbackQuery, state: FSMContext):
+    mp = cb.data.replace("mp_", "")
+    await state.update_data(marketplace=mp)
+    await state.set_state(AddFilterFSM.name)
+    await cb.message.edit_text(
+        "Введи <b>название</b> для этого фильтра (для удобства)\n"
+        "или пропусти — назову автоматически.",
+        parse_mode="HTML",
+        reply_markup=skip_kb()
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "skip_step", AddFilterFSM.name)
+@router.message(AddFilterFSM.name)
+async def fsm_name_done(event, state: FSMContext):
+    data = await state.get_data()
+    if isinstance(event, Message):
+        data["name"] = event.text.strip()
+    else:
+        # Auto-generate name
+        parts = []
+        if data.get("model"):
+            parts.append(data["model"])
+        if data.get("price_to"):
+            parts.append(f"до {data['price_to']} TON")
+        data["name"] = " · ".join(parts) if parts else "Фильтр"
+        event = event.message
+
+    filter_id = await add_filter(event.from_user.id, data["filter_type"], data)
+    await state.clear()
+
+    if filter_id is None:
+        await event.answer("❌ Лимит фильтров достигнут!")
+        return
+
+    # Build summary
+    lines = [f"✅ <b>Фильтр добавлен!</b> (#{filter_id})\n", f"📌 Название: <b>{data['name']}</b>"]
+    if data.get("model"):
+        lines.append(f"🎁 Модель: {data['model']}")
+    if data.get("background"):
+        lines.append(f"🎨 Фон: {data['background']}")
+    if data.get("number_from") or data.get("number_to"):
+        nf = data.get("number_from", "—")
+        nt = data.get("number_to", "—")
+        lines.append(f"🔢 Номер: {nf} – {nt}")
+    if data.get("price_from") or data.get("price_to"):
+        pf = data.get("price_from", "—")
+        pt = data.get("price_to", "—")
+        lines.append(f"💰 Цена: {pf} – {pt} TON")
+    lines.append(f"🌐 Маркетплейс: {data.get('marketplace', 'all')}")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ В меню", callback_data="menu_main")]
+    ])
+    await event.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+
+
+# ── LIST FILTERS ──────────────────────────────────────────────────────────────
+
+PAGE_SIZE = 5
+
+
+@router.callback_query(F.data.startswith("filter_list_"))
+async def cb_filter_list(cb: CallbackQuery):
+    parts = cb.data.split("_")
+    # filter_list_{type}_{page}
+    filter_type = parts[2]
+    page = int(parts[3]) if len(parts) > 3 else 0
+
+    filters = await get_filters(cb.from_user.id, filter_type)
+    if not filters:
+        await cb.message.edit_text(
+            "📭 У тебя пока нет фильтров этого типа.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data=f"menu_{'listings' if filter_type == 'listing' else 'sales'}")]
+            ])
+        )
+        await cb.answer()
+        return
+
+    total = len(filters)
+    start = page * PAGE_SIZE
+    end = min(start + PAGE_SIZE, total)
+    page_filters = filters[start:end]
+
+    lines = [f"📋 <b>Фильтры {'листингов' if filter_type == 'listing' else 'продаж'}</b> ({total})\n"]
+    buttons = []
+    for f in page_filters:
+        parts_info = []
+        if f.get("model"):
+            parts_info.append(f['model'])
+        if f.get("price_to"):
+            parts_info.append(f"до {f['price_to']} TON")
+        label = f.get("name") or (" · ".join(parts_info) if parts_info else f"Фильтр #{f['id']}")
+        lines.append(f"• <b>{label}</b> #{f['id']}")
+        buttons.append([InlineKeyboardButton(
+            text=f"🗑 Удалить #{f['id']} — {label[:20]}",
+            callback_data=f"filter_del_{f['id']}_{filter_type}"
+        )])
+
+    # Pagination
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"filter_list_{filter_type}_{page-1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"filter_list_{filter_type}_{page+1}"))
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"menu_{'listings' if filter_type == 'listing' else 'sales'}")])
+
+    await cb.message.edit_text(
+        "\n".join(lines), parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("filter_del_"))
+async def cb_filter_delete(cb: CallbackQuery):
+    parts = cb.data.split("_")
+    filter_id = int(parts[2])
+    filter_type = parts[3]
+
+    deleted = await delete_filter(filter_id, cb.from_user.id)
+    if deleted:
+        await cb.answer(f"✅ Фильтр #{filter_id} удалён.", show_alert=False)
+    else:
+        await cb.answer("❌ Фильтр не найден.", show_alert=True)
+
+    # Refresh list
+    filters = await get_filters(cb.from_user.id, filter_type)
+    if not filters:
+        await cb.message.edit_text(
+            "📭 Фильтров не осталось.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="menu_main")]
+            ])
+        )
+        return
+
+    # Re-render first page
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    await cb.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить список", callback_data=f"filter_list_{filter_type}_0")],
+        [InlineKeyboardButton(text="◀️ В меню", callback_data="menu_main")],
+    ]))
+
+from aiogram import Router, F
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+
+from middleware import AccessMiddleware
+
+router = Router()
+router.callback_query.middleware(AccessMiddleware())
+
+
+@router.callback_query(F.data == "menu_sales")
+async def cb_menu_sales(cb: CallbackQuery):
+    from db.database import get_filter_count
+    from config import MAX_FILTERS
+    count = await get_filter_count(cb.from_user.id)
+    await cb.message.edit_text(
+        f"💸 <b>Фильтры продаж</b>\n\n"
+        f"Активных фильтров: <b>{count}</b> / {MAX_FILTERS}\n\n"
+        f"Бот пришлёт уведомление, когда на маркетплейсе произойдёт продажа по твоим параметрам.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить фильтр", callback_data="filter_add_sale")],
+            [InlineKeyboardButton(text="📋 Мои фильтры", callback_data="filter_list_sale_0")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_main")],
+        ])
+    )
+    await cb.answer()
+
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import CommandStart
+
+from middleware import AccessMiddleware
+from db.database import get_filter_count, get_blocked_gifts
+from config import MAX_FILTERS
+
+router = Router()
+router.message.middleware(AccessMiddleware())
+router.callback_query.middleware(AccessMiddleware())
+
+
+def main_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📋 Фильтры листингов", callback_data="menu_listings"),
+            InlineKeyboardButton(text="💸 Фильтры продаж", callback_data="menu_sales"),
+        ],
+        [
+            InlineKeyboardButton(text="🚫 Заблокированные подарки", callback_data="menu_blocked"),
+        ],
+        [
+            InlineKeyboardButton(text="ℹ️ Статистика", callback_data="menu_stats"),
+        ],
+    ])
+
+
+@router.message(CommandStart())
+async def cmd_start(msg: Message):
+    await msg.answer(
+        "👋 <b>Gifts Pulse Bot</b>\n\n"
+        "Бот для мгновенных уведомлений о подарках на маркетплейсах:\n"
+        "<b>Tonnel · Portals · MRKT · GetGems</b>\n\n"
+        "Выбери раздел ниже 👇",
+        parse_mode="HTML",
+        reply_markup=main_menu_kb()
+    )
+
+
+@router.callback_query(F.data == "menu_main")
+async def cb_main_menu(cb: CallbackQuery):
+    await cb.message.edit_text(
+        "👋 <b>Gifts Pulse Bot</b>\n\n"
+        "Бот для мгновенных уведомлений о подарках на маркетплейсах:\n"
+        "<b>Tonnel · Portals · MRKT · GetGems</b>\n\n"
+        "Выбери раздел ниже 👇",
+        parse_mode="HTML",
+        reply_markup=main_menu_kb()
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "menu_stats")
+async def cb_stats(cb: CallbackQuery):
+    user_id = cb.from_user.id
+    count = await get_filter_count(user_id)
+    blocked = await get_blocked_gifts(user_id)
+
+    text = (
+        f"📊 <b>Твоя статистика</b>\n\n"
+        f"🔔 Активных фильтров: <b>{count}</b> / {MAX_FILTERS}\n"
+        f"🚫 Заблокированных подарков: <b>{len(blocked)}</b>\n"
+    )
+    await cb.message.edit_text(
+        text, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_main")]
+        ])
+    )
+    await cb.answer()
