@@ -1,0 +1,669 @@
+"""
+GetGems / TONAPI parser.
+Официальный публичный API: https://tonapi.io/v2
+Бесплатный ключ: https://tonconsole.com
+"""
+import aiohttp
+import logging
+import re
+
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+from config import TONAPI_KEY, GIFT_COLLECTIONS
+
+TONAPI_BASE = "https://tonapi.io/v2"
+
+def _headers():
+    h = {
+        "Accept": "application/json",
+        "User-Agent": "GiftsPulseBot/1.0"
+    }
+    if TONAPI_KEY:
+        h["Authorization"] = f"Bearer {TONAPI_KEY}"
+    return h
+
+
+def _parse_price(nano: str) -> float:
+    try:
+        return int(nano) / 1e9
+    except Exception:
+        return 0.0
+
+
+def _extract_number(name: str) -> Optional[int]:
+    m = re.search(r"#(\d+)", name)
+    return int(m.group(1)) if m else None
+
+
+def _extract_attrs(attributes: list) -> dict:
+    result = {}
+    for attr in attributes:
+        key = (attr.get("trait_type") or attr.get("traitType") or "").lower()
+        result[key] = attr.get("value") or attr.get("value") or ""
+    return result
+
+
+async def _get(path: str, params: dict = None) -> dict:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{TONAPI_BASE}{path}",
+            params=params,
+            headers=_headers(),
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                logger.warning(f"TONAPI {path} → {resp.status}: {text[:100]}")
+                return {}
+            return await resp.json()
+
+
+async def fetch_getgems_listings(limit: int = 50) -> list[dict]:
+    gifts = []
+    for collection_name, collection_address in GIFT_COLLECTIONS.items():
+        data = await _get(f"/nfts/collections/{collection_address}/items", {
+            "limit": min(limit, 1000),
+            "offset": 0
+        })
+        items = data.get("nft_items", [])
+        for item in items:
+            sale = item.get("sale")
+            if not sale:
+                continue
+
+            price_raw = (sale.get("price") or {}).get("value", "0")
+            price = _parse_price(price_raw)
+
+            meta = item.get("metadata") or {}
+            attrs = _extract_attrs(meta.get("attributes") or [])
+            name = meta.get("name") or ""
+            address = item.get("address", "")
+
+            gifts.append({
+                "id": f"gg_{address}",
+                "name": name,
+                "price": price,
+                "model": attrs.get("model") or attrs.get("name") or collection_name,
+                "background": attrs.get("backdrop") or attrs.get("background") or "",
+                "number": _extract_number(name),
+                "owner": (item.get("owner") or {}).get("address", ""),
+                "marketplace": "getgems",
+                "url": f"https://getgems.io/nft/{address}",
+                "type": "listing",
+            })
+    return gifts
+
+
+async def fetch_getgems_sales(limit: int = 20) -> list[dict]:
+    """
+    TONAPI v2 не предоставляет прямой эндпоинт "история продаж коллекции".
+    Продажи отслеживаются через Tonnel (parsers/tonnel.py), который
+    агрегирует сделки по всем видам подарков сразу.
+    Эта функция оставлена как заглушка для совместимости.
+    """
+    return []
+
+
+async def get_model_floor(model_name: str) -> Optional[float]:
+    gifts = await fetch_getgems_listings(limit=100)
+    prices = [
+        g["price"] for g in gifts
+        if model_name.lower() in (g.get("model") or "").lower() and g["price"] > 0
+    ]
+    return min(prices) if prices else None
+
+"""
+Portals marketplace parser.
+Portals использует авторизацию через Telegram WebApp.
+Без авторизации — только публичный поиск.
+MRKT = через TONAPI.
+"""
+import aiohttp
+import logging
+import re
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+PORTALS_BASE = "https://api.portals.fish"
+TONAPI_BASE = "https://tonapi.io/v2"
+
+from config import TONAPI_KEY
+
+PORTALS_HEADERS = {
+    "accept": "application/json",
+    "accept-language": "ru-RU,ru;q=0.9",
+    "origin": "https://portals.fish",
+    "referer": "https://portals.fish/",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+}
+
+
+def _num(name: str) -> Optional[int]:
+    m = re.search(r"#(\d+)", name)
+    return int(m.group(1)) if m else None
+
+
+def _parse_portals_gift(item: dict, gtype: str) -> dict:
+    attrs = item.get("attributes") or []
+    model = backdrop = ""
+    for a in attrs:
+        t = (a.get("type") or "").lower()
+        v = a.get("value") or ""
+        if t == "model":
+            model = v
+        elif t in ("backdrop", "background"):
+            backdrop = v
+
+    try:
+        price = float(item.get("price") or item.get("floor_price") or 0)
+    except Exception:
+        price = 0.0
+
+    name = item.get("name") or item.get("gift_name") or ""
+    tg_id = item.get("tg_id") or item.get("external_collection_number") or ""
+    item_id = item.get("id") or item.get("nft_id") or ""
+    slug = name.lower().replace(" ", "")
+
+    return {
+        "id": f"portals_{item_id}",
+        "name": name,
+        "price": price,
+        "model": model,
+        "background": backdrop,
+        "number": item.get("external_collection_number") or _num(name),
+        "owner": str(item.get("owner_id") or ""),
+        "marketplace": "portals",
+        "url": f"https://portals.fish/gift/{slug}-{tg_id}" if tg_id else "https://portals.fish",
+        "type": gtype,
+    }
+
+
+async def fetch_portals_listings(limit: int = 30) -> list[dict]:
+    """Пробуем несколько возможных эндпоинтов Portals."""
+    endpoints = [
+        f"{PORTALS_BASE}/v1/gifts?limit={limit}&sort=price_asc&status=listed",
+        f"{PORTALS_BASE}/v1/market?limit={limit}&sort=price_asc",
+        f"{PORTALS_BASE}/gifts?limit={limit}&sort=price_asc",
+    ]
+    for url in endpoints:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, headers=PORTALS_HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        items = data if isinstance(data, list) else data.get("gifts", data.get("items", data.get("data", [])))
+                        return [_parse_portals_gift(i, "listing") for i in items]
+                    elif resp.status == 401:
+                        logger.warning("Portals требует авторизацию — нужен authData от Telegram")
+                        return []
+                    else:
+                        logger.warning(f"Portals {url} → {resp.status}")
+        except Exception as e:
+            logger.debug(f"Portals endpoint {url} failed: {e}")
+    return []
+
+
+async def fetch_portals_sales(limit: int = 20) -> list[dict]:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{PORTALS_BASE}/v1/activity?limit={limit}&activityType=buy&sort=latest",
+                headers=PORTALS_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+        items = data if isinstance(data, list) else data.get("items", data.get("activity", []))
+        sales = []
+        for item in items:
+            nft = item.get("nft") or item
+            parsed = _parse_portals_gift(nft, "sale")
+            parsed["buyer"] = str(item.get("buyer_id") or "")
+            parsed["seller"] = str(item.get("seller_id") or "")
+            parsed["id"] = f"portals_sale_{item.get('id','')}"
+            sales.append(parsed)
+        return sales
+    except Exception as e:
+        logger.error(f"Portals sales error: {e}")
+        return []
+
+
+# ── MRKT через TONAPI ─────────────────────────────────────────────────────────
+
+
+def _tonapi_headers():
+    h = {"Accept": "application/json", "User-Agent": "GiftsPulseBot/1.0"}
+    if TONAPI_KEY:
+        h["Authorization"] = f"Bearer {TONAPI_KEY}"
+    return h
+
+
+async def fetch_mrkt_listings(limit: int = 20) -> list[dict]:
+    gifts = []
+    for collection_name, col in GIFT_COLLECTIONS.items():
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{TONAPI_BASE}/nfts/collections/{col}/items",
+                    params={"limit": min(limit, 1000), "offset": 0},
+                    headers=_tonapi_headers(),
+                    timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"MRKT/TONAPI {resp.status}")
+                        continue
+                    data = await resp.json()
+
+            for item in data.get("nft_items", []):
+                sale = item.get("sale")
+                if not sale:
+                    continue
+                price = int((sale.get("price") or {}).get("value", "0")) / 1e9
+                meta = item.get("metadata") or {}
+                attrs = {}
+                for a in meta.get("attributes") or []:
+                    k = (a.get("trait_type") or "").lower()
+                    attrs[k] = a.get("value") or ""
+                name = meta.get("name") or ""
+                address = item.get("address", "")
+                gifts.append({
+                    "id": f"mrkt_{address}",
+                    "name": name,
+                    "price": price,
+                    "model": attrs.get("model") or collection_name,
+                    "background": attrs.get("backdrop") or attrs.get("background") or "",
+                    "number": _num(name),
+                    "owner": (item.get("owner") or {}).get("address", ""),
+                    "marketplace": "mrkt",
+                    "url": f"https://getgems.io/nft/{address}",
+                    "type": "listing",
+                })
+        except Exception as e:
+            logger.error(f"MRKT listings error: {e}")
+    return gifts
+
+
+async def fetch_mrkt_sales(limit: int = 20) -> list[dict]:
+    """
+    TONAPI v2 не предоставляет прямой эндпоинт "история продаж коллекции".
+    Продажи отслеживаются через Tonnel (parsers/tonnel.py).
+    Эта функция оставлена как заглушка для совместимости.
+    """
+    return []
+
+"""
+Scheduler — polls all marketplaces every N seconds,
+matches gifts against user filters, sends notifications.
+"""
+import asyncio
+import logging
+from aiogram import Bot
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+from config import POLL_INTERVAL, ALLOWED_USERS
+from db.database import (
+    get_all_active_filters, is_seen, mark_seen,
+    is_blocked, cleanup_seen
+)
+from parsers.getgems import fetch_getgems_listings, fetch_getgems_sales, get_model_floor
+from parsers.tonnel import fetch_tonnel_listings, fetch_tonnel_sales
+from parsers.portals_mrkt import (
+    fetch_portals_listings, fetch_portals_sales,
+    fetch_mrkt_listings, fetch_mrkt_sales
+)
+
+logger = logging.getLogger(__name__)
+
+
+def gift_matches_filter(gift: dict, f: dict) -> bool:
+    """Check if a gift matches the filter criteria."""
+    # Filter type must match gift type
+    if f["filter_type"] != gift["type"]:
+        return False
+
+    # Marketplace check
+    mp = f.get("marketplace", "all")
+    if mp != "all" and mp != gift["marketplace"]:
+        return False
+
+    # Model check (case-insensitive partial match)
+    if f.get("model"):
+        gift_model = (gift.get("model") or "").lower()
+        if f["model"].lower() not in gift_model:
+            return False
+
+    # Background check
+    if f.get("background"):
+        gift_bg = (gift.get("background") or "").lower()
+        if f["background"].lower() not in gift_bg:
+            return False
+
+    # Number range
+    gift_num = gift.get("number")
+    if f.get("number_from") is not None and gift_num is not None:
+        if gift_num < f["number_from"]:
+            return False
+    if f.get("number_to") is not None and gift_num is not None:
+        if gift_num > f["number_to"]:
+            return False
+
+    # Price range
+    gift_price = gift.get("price", 0)
+    if f.get("price_from") is not None:
+        if gift_price < f["price_from"]:
+            return False
+    if f.get("price_to") is not None:
+        if gift_price > f["price_to"]:
+            return False
+
+    return True
+
+
+def format_notification(gift: dict, model_floor: float = None, gift_floor: float = None, owners: list = None) -> str:
+    emoji = "🔔" if gift["type"] == "listing" else "💸"
+    mp_labels = {
+        "getgems": "GetGems",
+        "tonnel": "Tonnel",
+        "portals": "Portals",
+        "mrkt": "MRKT",
+    }
+    mp_name = mp_labels.get(gift["marketplace"], gift["marketplace"].upper())
+
+    lines = [
+        f"{emoji} <b>{'Новый листинг' if gift['type'] == 'listing' else 'Продажа'} на {mp_name}</b>",
+        "",
+        f"🎁 <b>{gift['name']}</b>",
+    ]
+
+    if gift.get("model"):
+        lines.append(f"📦 Модель: {gift['model']}")
+    if gift.get("background"):
+        lines.append(f"🎨 Фон: {gift['background']}")
+    if gift.get("number"):
+        lines.append(f"🔢 Номер: #{gift['number']}")
+
+    lines.append(f"💰 Цена: <b>{gift['price']:.2f} TON</b>")
+
+    if model_floor is not None:
+        lines.append(f"📊 Флор модели: {model_floor:.2f} TON")
+    if gift_floor is not None:
+        lines.append(f"📉 Флор подарка: {gift_floor:.2f} TON")
+
+    if gift["type"] == "sale":
+        if gift.get("seller"):
+            short_seller = gift["seller"][:8] + "..." if len(gift.get("seller", "")) > 8 else gift.get("seller", "")
+            lines.append(f"👤 Продавец: <code>{short_seller}</code>")
+        if gift.get("buyer"):
+            short_buyer = gift["buyer"][:8] + "..." if len(gift.get("buyer", "")) > 8 else gift.get("buyer", "")
+            lines.append(f"🛒 Покупатель: <code>{short_buyer}</code>")
+    else:
+        if gift.get("owner"):
+            short_owner = gift["owner"][:8] + "..." if len(gift.get("owner", "")) > 8 else gift.get("owner", "")
+            lines.append(f"👤 Владелец: <code>{short_owner}</code>")
+
+    if owners:
+        lines.append(f"📜 Последние владельцы: {', '.join(owners[:3])}")
+
+    return "\n".join(lines)
+
+
+def notification_kb(gift: dict) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text="🔗 Открыть", url=gift["url"])],
+        [InlineKeyboardButton(
+            text="🚫 Заблокировать этот подарок",
+            callback_data=f"blockgift_{gift['id'][:30]}_{gift['marketplace']}"
+        )],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def fetch_all_gifts() -> list[dict]:
+    """Fetch listings and sales from all marketplaces concurrently."""
+    tasks = [
+        fetch_getgems_listings(),
+        fetch_getgems_sales(),
+        fetch_tonnel_listings(),
+        fetch_tonnel_sales(),
+        fetch_portals_listings(),
+        fetch_portals_sales(),
+        fetch_mrkt_listings(),
+        fetch_mrkt_sales(),
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    gifts = []
+    for r in results:
+        if isinstance(r, list):
+            gifts.extend(r)
+        elif isinstance(r, Exception):
+            logger.error(f"Fetch error: {r}")
+    return gifts
+
+
+async def process_gifts(bot: Bot, gifts: list[dict]):
+    """Match gifts against filters and notify users."""
+    if not gifts:
+        return
+
+    filters = await get_all_active_filters()
+    if not filters:
+        return
+
+    for gift in gifts:
+        gift_id = gift["id"]
+        marketplace = gift["marketplace"]
+
+        if not gift_id:
+            continue
+
+        # Skip already seen gifts
+        if await is_seen(gift_id, marketplace):
+            continue
+
+        await mark_seen(gift_id, marketplace)
+
+        # Check against every filter
+        for f in filters:
+            user_id = f["user_id"]
+
+            # Only allowed users
+            if user_id not in ALLOWED_USERS:
+                continue
+
+            # Check if this gift is blocked by this user
+            if await is_blocked(user_id, gift_id, marketplace):
+                continue
+
+            if not gift_matches_filter(gift, f):
+                continue
+
+            # Fetch floor data if available
+            model_floor = None
+            if gift.get("marketplace") == "getgems" and gift.get("model"):
+                try:
+                    model_floor = await get_model_floor(gift["model"])
+                except Exception:
+                    pass
+
+            text = format_notification(gift, model_floor=model_floor)
+            kb = notification_kb(gift)
+
+            try:
+                await bot.send_message(
+                    user_id,
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=kb,
+                    disable_web_page_preview=True
+                )
+            except Exception as e:
+                logger.error(f"Send notification error to {user_id}: {e}")
+
+
+async def polling_loop(bot: Bot):
+    cleanup_counter = 0
+    while True:
+        try:
+            gifts = await fetch_all_gifts()
+            logger.info(f"Fetched {len(gifts)} gifts from all marketplaces")
+            await process_gifts(bot, gifts)
+        except Exception as e:
+            logger.error(f"Polling loop error: {e}")
+
+        # Clean up old seen records every ~1 hour
+        cleanup_counter += 1
+        if cleanup_counter >= 360:  # 360 * 10s = 1 hour
+            await cleanup_seen(days=3)
+            cleanup_counter = 0
+
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+async def start_scheduler(bot: Bot):
+    asyncio.create_task(polling_loop(bot))
+    logger.info(f"Scheduler started, polling every {POLL_INTERVAL}s")
+
+"""
+Tonnel marketplace parser.
+Тоннель закрыл публичный API — используем TONAPI для данных с блокчейна,
+а для маркетплейса Tonnel парсим через их WebApp API.
+"""
+import aiohttp
+import logging
+import json
+import re
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# Tonnel использует этот эндпоинт для своего фронтенда
+TONNEL_ENDPOINT = "https://gifts2.tonnel.network/api/gifts"
+
+HEADERS = {
+    "accept": "application/json, text/plain, */*",
+    "accept-language": "ru-RU,ru;q=0.9",
+    "content-type": "application/json",
+    "origin": "https://market.tonnel.network",
+    "referer": "https://market.tonnel.network/",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-site",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+}
+
+
+def _num(name: str) -> Optional[int]:
+    m = re.search(r"#(\d+)", name)
+    return int(m.group(1)) if m else None
+
+
+async def _post(payload: dict) -> list:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                TONNEL_ENDPOINT,
+                json=payload,
+                headers=HEADERS,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status == 403:
+                    logger.warning("Tonnel 403 — IP заблокирован. Работает только с VPS/Railway.")
+                    return []
+                if resp.status != 200:
+                    logger.warning(f"Tonnel {resp.status}")
+                    return []
+                data = await resp.json()
+                if isinstance(data, list):
+                    return data
+                return data.get("gifts", data.get("items", []))
+    except Exception as e:
+        logger.error(f"Tonnel error: {e}")
+        return []
+
+
+async def fetch_tonnel_listings(limit: int = 30) -> list[dict]:
+    payload = {
+        "page": 1,
+        "limit": min(limit, 30),
+        "sort": json.dumps({"price": 1}),
+        "filter": json.dumps({
+            "price": {"$exists": True},
+            "refunded": {"$ne": True},
+            "buyer": {"$exists": False},
+            "export_at": {"$exists": True},
+            "asset": "TON"
+        }),
+        "price_range": None,
+        "user_auth": ""
+    }
+    items = await _post(payload)
+    gifts = []
+    for item in items:
+        try:
+            price = float(item.get("price", 0))
+        except Exception:
+            price = 0.0
+        name = item.get("gift_name") or item.get("name") or ""
+        gid = str(item.get("gift_id") or item.get("_id") or "")
+        gifts.append({
+            "id": f"tonnel_{gid}",
+            "name": name,
+            "price": price,
+            "model": item.get("model") or "",
+            "background": item.get("backdrop") or item.get("background") or "",
+            "number": item.get("gift_num") or _num(name),
+            "owner": str(item.get("owner") or ""),
+            "marketplace": "tonnel",
+            "url": f"https://market.tonnel.network/gift/{gid}",
+            "type": "listing",
+        })
+    return gifts
+
+
+async def fetch_tonnel_sales(limit: int = 20) -> list[dict]:
+    payload = {
+        "page": 1,
+        "limit": min(limit, 30),
+        "sort": json.dumps({"message_post_time": -1}),
+        "filter": json.dumps({
+            "buyer": {"$exists": True},
+            "refunded": {"$ne": True},
+            "asset": "TON"
+        }),
+        "price_range": None,
+        "user_auth": ""
+    }
+    items = await _post(payload)
+    sales = []
+    for item in items:
+        try:
+            price = float(item.get("price", 0))
+        except Exception:
+            price = 0.0
+        name = item.get("gift_name") or item.get("name") or ""
+        gid = str(item.get("gift_id") or item.get("_id") or "")
+        ts = item.get("message_post_time") or item.get("updated_at") or ""
+        sales.append({
+            "id": f"tonnel_sale_{gid}_{ts}",
+            "name": name,
+            "price": price,
+            "model": item.get("model") or "",
+            "background": item.get("backdrop") or item.get("background") or "",
+            "number": item.get("gift_num") or _num(name),
+            "buyer": str(item.get("buyer") or ""),
+            "seller": str(item.get("owner") or ""),
+            "marketplace": "tonnel",
+            "url": f"https://market.tonnel.network/gift/{gid}",
+            "type": "sale",
+        })
+    return sales
