@@ -1,0 +1,195 @@
+import aiosqlite
+import json
+import logging
+
+DB_PATH = "gifts_bot.db"
+logger = logging.getLogger(__name__)
+
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS filters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                filter_type TEXT NOT NULL,  -- 'listing' or 'sale'
+                name TEXT,
+                model TEXT,
+                background TEXT,
+                number_from INTEGER,
+                number_to INTEGER,
+                price_from REAL,
+                price_to REAL,
+                marketplace TEXT,           -- 'all', 'getgems', 'tonnel', 'portals', 'mrkt'
+                active INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS blocked_gifts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                gift_id TEXT NOT NULL,
+                marketplace TEXT NOT NULL,
+                blocked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, gift_id, marketplace)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS seen_gifts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                gift_id TEXT NOT NULL,
+                marketplace TEXT NOT NULL,
+                seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(gift_id, marketplace)
+            )
+        """)
+        await db.commit()
+    logger.info("Database initialized.")
+
+
+# ── FILTERS ──────────────────────────────────────────────────────────────────
+
+async def add_filter(user_id: int, filter_type: str, data: dict) -> int | None:
+    """Add a new filter. Returns filter id or None if limit reached."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM filters WHERE user_id=? AND active=1", (user_id,)
+        ) as cur:
+            count = (await cur.fetchone())[0]
+
+        from config import MAX_FILTERS
+        if count >= MAX_FILTERS:
+            return None
+
+        cursor = await db.execute("""
+            INSERT INTO filters (user_id, filter_type, name, model, background,
+                                 number_from, number_to, price_from, price_to, marketplace)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user_id, filter_type,
+            data.get("name"),
+            data.get("model"),
+            data.get("background"),
+            data.get("number_from"),
+            data.get("number_to"),
+            data.get("price_from"),
+            data.get("price_to"),
+            data.get("marketplace", "all"),
+        ))
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_filters(user_id: int, filter_type: str = None) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if filter_type:
+            async with db.execute(
+                "SELECT * FROM filters WHERE user_id=? AND filter_type=? AND active=1 ORDER BY id DESC",
+                (user_id, filter_type)
+            ) as cur:
+                rows = await cur.fetchall()
+        else:
+            async with db.execute(
+                "SELECT * FROM filters WHERE user_id=? AND active=1 ORDER BY id DESC",
+                (user_id,)
+            ) as cur:
+                rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_all_active_filters() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM filters WHERE active=1") as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def delete_filter(filter_id: int, user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE filters SET active=0 WHERE id=? AND user_id=?",
+            (filter_id, user_id)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def get_filter_count(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM filters WHERE user_id=? AND active=1", (user_id,)
+        ) as cur:
+            return (await cur.fetchone())[0]
+
+
+# ── BLOCKED GIFTS ─────────────────────────────────────────────────────────────
+
+async def block_gift(user_id: int, gift_id: str, marketplace: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO blocked_gifts (user_id, gift_id, marketplace) VALUES (?,?,?)",
+            (user_id, gift_id, marketplace)
+        )
+        await db.commit()
+
+
+async def is_blocked(user_id: int, gift_id: str, marketplace: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM blocked_gifts WHERE user_id=? AND gift_id=? AND marketplace=?",
+            (user_id, gift_id, marketplace)
+        ) as cur:
+            return (await cur.fetchone()) is not None
+
+
+async def get_blocked_gifts(user_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM blocked_gifts WHERE user_id=? ORDER BY blocked_at DESC",
+            (user_id,)
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def unblock_gift(user_id: int, gift_id: str, marketplace: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM blocked_gifts WHERE user_id=? AND gift_id=? AND marketplace=?",
+            (user_id, gift_id, marketplace)
+        )
+        await db.commit()
+
+
+# ── SEEN GIFTS ────────────────────────────────────────────────────────────────
+
+async def mark_seen(gift_id: str, marketplace: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO seen_gifts (gift_id, marketplace) VALUES (?,?)",
+            (gift_id, marketplace)
+        )
+        await db.commit()
+
+
+async def is_seen(gift_id: str, marketplace: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM seen_gifts WHERE gift_id=? AND marketplace=?",
+            (gift_id, marketplace)
+        ) as cur:
+            return (await cur.fetchone()) is not None
+
+
+async def cleanup_seen(days: int = 3):
+    """Remove old seen records to keep DB small."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM seen_gifts WHERE seen_at < datetime('now', ?)",
+            (f"-{days} days",)
+        )
+        await db.commit()
